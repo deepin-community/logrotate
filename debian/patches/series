@@ -1,0 +1,2 @@
+debian/skip-cronjob-when-running-with-systemd.patch
+debian/logrotate.conf-disable-dateext-on-Debian.patch
