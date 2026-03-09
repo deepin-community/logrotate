@@ -1,8 +1,4 @@
 #include "queue.h"
-/* alloca() is defined in stdlib.h in NetBSD */
-#if !defined(__NetBSD__) && !defined(__FreeBSD__) && !defined(__OpenBSD__)
-#include <alloca.h>
-#endif
 #include <limits.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -108,8 +104,6 @@ static int globerr(const char *pathname, int theerr)
     return 1;
 }
 
-#if defined(HAVE_STRPTIME) && defined(HAVE_QSORT)
-
 /* We could switch to qsort_r to get rid of this global variable,
  * but qsort_r is not portable enough (Linux vs. *BSD vs ...)... */
 static struct compData _compData;
@@ -142,11 +136,6 @@ static void sortGlobResult(glob_t *result, size_t prefix_len, const char *dforma
     _compData.dformat = dformat;
     qsort(result->gl_pathv, result->gl_pathc, sizeof(char *), compGlobResult);
 }
-#else
-static void sortGlobResult(glob_t *result, size_t prefix_len, const char *dformat) {
-    /* TODO */
-}
-#endif
 
 int switch_user(uid_t user, gid_t group) {
     save_egid = getegid();
@@ -203,10 +192,16 @@ static int switch_user_permanently(const struct logInfo *log) {
         return 1;
     }
 
-    if (user != ROOT_UID && setuid(ROOT_UID) != -1) {
+    if (user != ROOT_UID && (setuid(ROOT_UID) != -1 || seteuid(ROOT_UID) != -1)) {
         message(MESS_ERROR, "failed to switch user permanently, able to switch back (pid %d)\n",
                 getpid());
         return 1;
+    }
+
+    if (chdir("/") != 0) {
+        message(MESS_ERROR, "failed to change current directory to root path: %s\n",
+                strerror(errno));
+        return -1;
     }
 
     return 0;
@@ -223,6 +218,47 @@ static int switch_user_back_permanently(void) {
     save_euid = tmp_euid;
     save_egid = tmp_egid;
     return ret;
+}
+
+static int open_logfile(const char *path, const struct logInfo *log, int write_access) {
+    int fd, flags;
+    struct stat sb;
+
+    fd = open(path, O_NOFOLLOW | O_NOCTTY | O_NONBLOCK | (write_access ? O_RDWR : O_RDONLY));
+    if (fd < 0)
+        return fd;
+
+    if (fstat(fd, &sb) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (! S_ISREG(sb.st_mode)) {
+        close(fd);
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    if (sb.st_nlink != 1 && !(log->flags & LOG_FLAG_ALLOWHARDLINK)) {
+        close(fd);
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    /*
+     * Unset O_NONBLOCK for portability, since O_NONBLOCK is unspecified for
+     * regular files by POSIX.
+     */
+    if ((flags = fcntl(fd, F_GETFL)) == -1) {
+        close(fd);
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
 static void unescape(char *arg)
@@ -348,6 +384,7 @@ static int setSecCtx(int fdSrc, const char *src, char **pPrevCtx)
     /* save default security context for restoreSecCtx() */
     if (getfscreatecon_raw(pPrevCtx) < 0) {
         message(MESS_ERROR, "getting default context: %s\n", strerror(errno));
+        freecon(srcCtx);
         return selinux_enforce;
     }
 
@@ -355,6 +392,8 @@ static int setSecCtx(int fdSrc, const char *src, char **pPrevCtx)
     if (setfscreatecon_raw(srcCtx) < 0) {
         message(MESS_ERROR, "setting default context to %s: %s\n", srcCtx,
                 strerror(errno));
+        freecon(*pPrevCtx);
+        *pPrevCtx = NULL;
         freecon(srcCtx);
         return selinux_enforce;
     }
@@ -369,11 +408,17 @@ static int setSecCtx(int fdSrc, const char *src, char **pPrevCtx)
     return 0;
 }
 
-static int setSecCtxByName(const char *src, char **pPrevCtx)
+static int setSecCtxByName(const char *src, const struct logInfo *log, char **pPrevCtx)
 {
     int hasErrors = 0;
 #ifdef WITH_SELINUX
-    int fd = open(src, O_RDONLY | O_NOFOLLOW);
+    int fd;
+
+    if (!selinux_enabled)
+        /* pretend success */
+        return 0;
+
+    fd = open_logfile(src, log, 0);
     if (fd < 0) {
         message(MESS_ERROR, "error opening %s: %s\n", src, strerror(errno));
         return 1;
@@ -382,6 +427,7 @@ static int setSecCtxByName(const char *src, char **pPrevCtx)
     close(fd);
 #else
     (void) src;
+    (void) log;
     (void) pPrevCtx;
 #endif
     return hasErrors;
@@ -531,7 +577,7 @@ static int createOutputFile(const char *fileName, int flags, const struct stat *
         size_t fileName_size, buf_size;
         char *backupName, *ptr;
 
-        fd = open(fileName, (flags | O_EXCL | O_NOFOLLOW),
+        fd = open(fileName, (flags | O_CREAT | O_EXCL | O_NOFOLLOW),
                 (S_IRUSR | S_IWUSR) & sb->st_mode);
 
         if ((fd >= 0) || (errno != EEXIST))
@@ -541,7 +587,11 @@ static int createOutputFile(const char *fileName, int flags, const struct stat *
         localtime_r(&nowSecs, &now);
         fileName_size = strlen(fileName);
         buf_size = fileName_size + sizeof("-YYYYMMDDHH.backup");
-        backupName = alloca(buf_size);
+        backupName = malloc(buf_size);
+        if (!backupName) {
+            message_OOM();
+            return -1;
+        }
         ptr = backupName;
 
         /* construct backupName starting with fileName */
@@ -558,8 +608,12 @@ static int createOutputFile(const char *fileName, int flags, const struct stat *
         if (rename(fileName, backupName) != 0) {
             message(MESS_ERROR, "error renaming already existing output file"
                     " %s to %s: %s\n", fileName, backupName, strerror(errno));
+            free(backupName);
             return -1;
         }
+
+        free(backupName);
+
         /* existing file renamed, try it once again */
     }
 
@@ -625,14 +679,12 @@ static int createOutputFile(const char *fileName, int flags, const struct stat *
     return fd;
 }
 
-#define DIGITS 12
-
 /* unlink, but try to call shred from GNU coreutils if LOG_FLAG_SHRED
  * is enabled (in that case fd needs to be a valid file descriptor) */
 static int shred_file(int fd, const char *filename, const struct logInfo *log)
 {
-    char count[DIGITS];    /*  that's a lot of shredding :)  */
-    const char **fullCommand;
+    char count[12];    /*  11 digits - that's a lot of shredding :)  */
+    const char *fullCommand[6];
     int id = 0;
     int status;
     pid_t pid;
@@ -654,20 +706,29 @@ static int shred_file(int fd, const char *filename, const struct logInfo *log)
         goto unlink_file;
     }
 
+    if (!(log->flags & LOG_FLAG_ALLOWHARDLINK)) {
+        struct stat sb;
+        if (fstat(fd, &sb) != 0) {
+            message(MESS_ERROR, "cannot stat %s: %s\n", filename, strerror(errno));
+            return 1;
+        }
+
+        if (sb.st_nlink != 1) {
+            message(MESS_ERROR, "failed to shred \"%s\", because shredding files with"
+                    " multiple hard links is disabled for %s.\n",
+                    filename, log->pattern);
+            return 1;
+        }
+    }
+
     message(MESS_DEBUG, "Using shred to remove the file %s\n", filename);
 
-    if (log->shred_cycles != 0) {
-        fullCommand = alloca(sizeof(*fullCommand) * 6);
-    }
-    else {
-        fullCommand = alloca(sizeof(*fullCommand) * 4);
-    }
     fullCommand[id++] = "shred";
     fullCommand[id++] = "-u";
 
     if (log->shred_cycles != 0) {
         fullCommand[id++] = "-n";
-        snprintf(count, DIGITS - 1, "%d", log->shred_cycles);
+        snprintf(count, sizeof(count), "%d", log->shred_cycles);
         fullCommand[id++] = count;
     }
     fullCommand[id++] = "-";
@@ -721,7 +782,7 @@ static int removeLogFile(const char *name, const struct logInfo *log)
     message(MESS_DEBUG, "removing old log %s\n", name);
 
     if (log->flags & LOG_FLAG_SHRED) {
-        fd = open(name, O_RDWR | O_NOFOLLOW);
+        fd = open_logfile(name, log, 1);
         if (fd < 0) {
             message(MESS_ERROR, "error opening %s: %s\n",
                     name, strerror(errno));
@@ -740,69 +801,55 @@ static int removeLogFile(const char *name, const struct logInfo *log)
     return result;
 }
 
-static void setAtimeMtime(const char *filename, const struct stat *sb)
+static void setAtimeMtime(int fd, const char *filename, const struct stat *sb)
 {
     /* If we can't change atime/mtime, it's not a disaster.  It might
        possibly fail under SELinux. But do try to preserve the
        fractional part if we have utimensat(). */
-#if defined HAVE_UTIMENSAT && !defined(__APPLE__)
+#if defined HAVE_FUTIMENS && defined HAVE_STRUCT_STAT_ST_ATIM && defined HAVE_STRUCT_STAT_ST_MTIM
     struct timespec ts[2];
 
     ts[0] = sb->st_atim;
     ts[1] = sb->st_mtim;
-    utimensat(AT_FDCWD, filename, ts, 0);
+    futimens(fd, ts);
+
+    (void)filename;
+#elif defined HAVE_UTIMENSAT && defined HAVE_STRUCT_STAT_ST_ATIM && defined HAVE_STRUCT_STAT_ST_MTIM
+    struct timespec ts[2];
+
+    ts[0] = sb->st_atim;
+    ts[1] = sb->st_mtim;
+    utimensat(AT_FDCWD, filename, ts, AT_SYMLINK_NOFOLLOW);
+
+    (void)fd;
 #else
     struct utimbuf utim;
 
     utim.actime = sb->st_atime;
     utim.modtime = sb->st_mtime;
     utime(filename, &utim);
+
+    (void)fd;
 #endif
 }
 
 static int compressLogFile(const char *name, const struct logInfo *log, const struct stat *sb)
 {
     char *compressedName;
-    const char **fullCommand;
     int inFile;
     int outFile;
-    int i;
     int status;
     int compressPipe[2];
-    char buff[4092];
-    ssize_t n_read;
-    int error_printed = 0;
     char *prevCtx;
     pid_t pid;
-    int in_flags;
-    const char *in_how;
 
     message(MESS_DEBUG, "compressing log with: %s\n", log->compress_prog);
     if (debug)
         return 0;
 
-    fullCommand = alloca(sizeof(*fullCommand) *
-            ((unsigned)log->compress_options_count + 2));
-    fullCommand[0] = log->compress_prog;
-    for (i = 0; i < log->compress_options_count; i++)
-        fullCommand[i + 1] = log->compress_options_list[i];
-    fullCommand[log->compress_options_count + 1] = NULL;
-
-    compressedName = alloca(strlen(name) + strlen(log->compress_ext) + 2);
-    sprintf(compressedName, "%s%s", name, log->compress_ext);
-
-    in_flags = O_NOFOLLOW;
-    if (log->flags & LOG_FLAG_SHRED) {
-        /* need write access for shredding */
-        in_flags |= O_RDWR;
-        in_how = "read-write";
-    } else {
-        in_flags |= O_RDONLY;
-        in_how = "read-only";
-    }
-    if ((inFile = open(name, in_flags)) < 0) {
+    if ((inFile = open_logfile(name, log, log->flags & LOG_FLAG_SHRED)) < 0) {
         message(MESS_ERROR, "unable to open %s (%s) for compression: %s\n",
-            name, in_how, strerror(errno));
+            name, (log->flags & LOG_FLAG_SHRED) ? "read-write" : "read-only", strerror(errno));
         return 1;
     }
 
@@ -824,8 +871,14 @@ static int compressLogFile(const char *name, const struct logInfo *log, const st
     }
 #endif
 
+    if (asprintf(&compressedName, "%s%s", name, log->compress_ext) < 0) {
+        message_OOM();
+        close(inFile);
+        return 1;
+    }
+
     outFile =
-        createOutputFile(compressedName, O_RDWR | O_CREAT, sb, prev_acl, 0);
+        createOutputFile(compressedName, O_RDWR, sb, prev_acl, 0);
     restoreSecCtx(&prevCtx);
 #ifdef WITH_ACL
     if (prev_acl) {
@@ -835,6 +888,7 @@ static int compressLogFile(const char *name, const struct logInfo *log, const st
 #endif
     if (outFile < 0) {
         close(inFile);
+        free(compressedName);
         return 1;
     }
 
@@ -844,6 +898,7 @@ static int compressLogFile(const char *name, const struct logInfo *log, const st
                 strerror(errno));
         close(inFile);
         close(outFile);
+        free(compressedName);
         return 1;
     }
 
@@ -855,14 +910,17 @@ static int compressLogFile(const char *name, const struct logInfo *log, const st
         close(outFile);
         close(compressPipe[1]);
         close(compressPipe[0]);
+        free(compressedName);
         return 1;
     }
 
     if (pid == 0) {
-        char *envInFilename;
+        const char **fullCommand;
+        int i;
 
         /* close read end of pipe in the child process */
         close(compressPipe[0]);
+        free(compressedName);
 
         movefd(inFile, STDIN_FILENO);
         movefd(outFile, STDOUT_FILENO);
@@ -873,40 +931,81 @@ static int compressLogFile(const char *name, const struct logInfo *log, const st
 
         movefd(compressPipe[1], STDERR_FILENO);
 
-        envInFilename = alloca(strlen("LOGROTATE_COMPRESSED_FILENAME=") + strlen(name) + 2);
-        sprintf(envInFilename, "LOGROTATE_COMPRESSED_FILENAME=%s", name);
-        putenv(envInFilename);
+        /* export name of file to compress for custom compress scripts */
+        {
+                char *envInFilename;
+                if (asprintf(&envInFilename, "LOGROTATE_COMPRESSED_FILENAME=%s", name) < 0) {
+                    message_OOM();
+                    exit(1);
+                }
+                putenv(envInFilename);
+                /* do not free envInFilename, cause putenv(3) might not create a copy */
+        }
+
+        fullCommand = malloc(sizeof(*fullCommand) * ((size_t)log->compress_options_count + 2));
+        if (!fullCommand) {
+            message_OOM();
+            exit(1);
+        }
+
+        fullCommand[0] = log->compress_prog;
+        for (i = 0; i < log->compress_options_count; i++)
+            fullCommand[i + 1] = log->compress_options_list[i];
+        fullCommand[log->compress_options_count + 1] = NULL;
+
         execvp(fullCommand[0], (void *) fullCommand);
-        message(MESS_ERROR, "cannot execute compress command: %s\n", strerror(errno));
+        message(MESS_ERROR, "cannot execute compress command '%s': %s\n", fullCommand[0], strerror(errno));
         exit(1);
     }
 
     /* close write end of pipe in the parent process */
     close(compressPipe[1]);
 
-    while ((n_read = read(compressPipe[0], buff, sizeof(buff) - 1)) > 0) {
-        if (!error_printed) {
-            error_printed = 1;
-            message(MESS_ERROR, "Compressing program wrote following message "
-                    "to stderr when compressing log %s:\n", name);
+    {
+        int error_printed = 0;
+
+        for (;;) {
+            char buff[4096];
+            ssize_t n_read = read(compressPipe[0], buff, sizeof(buff) - 1);
+
+            if (n_read < 0) {
+                if (errno == EINTR)
+                    continue;
+                else
+                    break;
+            }
+
+            if (n_read == 0)
+                break;
+
+            if (!error_printed) {
+                error_printed = 1;
+                message(MESS_ERROR, "Compressing program wrote following message "
+                        "to stderr when compressing log %s:\n", name);
+            }
+            buff[n_read] = '\0';
+            fprintf(stderr, "%s", buff);
         }
-        buff[n_read] = '\0';
-        fprintf(stderr, "%s", buff);
     }
+
     close(compressPipe[0]);
     wait(&status);
 
     fsync(outFile);
-    close(outFile);
 
     if (!WIFEXITED(status) || WEXITSTATUS(status)) {
         message(MESS_ERROR, "failed to compress log %s\n", name);
         close(inFile);
+        close(outFile);
         unlink(compressedName);
+        free(compressedName);
         return 1;
     }
 
-    setAtimeMtime(compressedName, sb);
+    setAtimeMtime(outFile, compressedName, sb);
+
+    close(outFile);
+    free(compressedName);
 
     if (shred_file(inFile, name, log)) {
         close(inFile);
@@ -928,7 +1027,7 @@ static int mailLog(const struct logInfo *log, const char *logFile, const char *m
     char * const mailArgv[] = { (char *) mailComm, (char *) "-s", (char *) subject, (char *) address, NULL };
     int rc = 0;
 
-    if ((mailInput = open(logFile, O_RDONLY | O_NOFOLLOW)) < 0) {
+    if ((mailInput = open_logfile(logFile, log, 0)) < 0) {
         message(MESS_ERROR, "failed to open %s for mailing: %s\n", logFile,
                 strerror(errno));
         return 1;
@@ -1080,18 +1179,18 @@ static int is_nul (void const *buf, size_t bufsize)
 static size_t full_write(int fd, const void *buf, size_t count)
 {
     size_t total = 0;
-    const char *ptr = (const char *) buf;
+    const unsigned char *ptr = (const unsigned char *) buf;
 
     while (count > 0)
     {
         size_t n_rw;
         for (;;)
         {
-            n_rw = (size_t)write (fd, buf, count);
-            if (errno == EINTR)
+            n_rw = (size_t)write (fd, ptr, count);
+            if (n_rw == (size_t) -1 && errno == EINTR)
                 continue;
-            else
-                break;
+
+            break;
         }
         if (n_rw == (size_t) -1)
             break;
@@ -1171,18 +1270,18 @@ static int sparse_copy(int src_fd, int dest_fd, const struct stat *sb,
 }
 
 static int copyTruncate(const char *currLog, const char *saveLog, const struct stat *sb,
-                        int flags, int skip_copy)
+                        const struct logInfo *log, int skip_copy)
 {
     int rc = 1;
     int fdcurr = -1, fdsave = -1;
 
-    message(MESS_DEBUG, "copying %s to %s\n", currLog, saveLog);
+    message(MESS_DEBUG, "%scopying %s to %s\n", skip_copy ? "skip " : "", currLog, saveLog);
 
     if (!debug) {
         /* read access is sufficient for 'copy' but not for 'copytruncate' */
-        const int read_only = (flags & LOG_FLAG_COPY)
-            && !(flags & LOG_FLAG_COPYTRUNCATE);
-        if ((fdcurr = open(currLog, ((read_only) ? O_RDONLY : O_RDWR) | O_NOFOLLOW)) < 0) {
+        const int read_only = (log->flags & LOG_FLAG_COPY)
+            && !(log->flags & LOG_FLAG_COPYTRUNCATE);
+        if ((fdcurr = open_logfile(currLog, log, !read_only)) < 0) {
             message(MESS_ERROR, "error opening %s: %s\n", currLog,
                     strerror(errno));
             goto fail;
@@ -1205,7 +1304,7 @@ static int copyTruncate(const char *currLog, const char *saveLog, const struct s
                 }
             }
 #endif /* WITH_ACL */
-            fdsave = createOutputFile(saveLog, O_WRONLY | O_CREAT, sb, prev_acl, 0);
+            fdsave = createOutputFile(saveLog, O_WRONLY, sb, prev_acl, 0);
             restoreSecCtx(&prevCtx);
 #ifdef WITH_ACL
             if (prev_acl) {
@@ -1225,7 +1324,7 @@ static int copyTruncate(const char *currLog, const char *saveLog, const struct s
         }
     }
 
-    if (flags & LOG_FLAG_COPYTRUNCATE) {
+    if (log->flags & LOG_FLAG_COPYTRUNCATE) {
         message(MESS_DEBUG, "truncating %s\n", currLog);
 
         if (!debug) {
@@ -1266,16 +1365,16 @@ static time_t mktimeFromDateOnly(const struct tm *src)
 }
 
 /* return by how many days the date was advanced but ignore exact time */
-static time_t daysElapsed(const struct tm *now, const struct tm *last)
+static long daysElapsed(const struct tm *now, const struct tm *last)
 {
-    const time_t diff = mktimeFromDateOnly(now) - mktimeFromDateOnly(last);
-    return diff / (24 * 3600);
+    const double diff = difftime(mktimeFromDateOnly(now), mktimeFromDateOnly(last));
+    return (long) ((intmax_t)diff / DAY_SECONDS);
 }
 
 static int findNeedRotating(const struct logInfo *log, unsigned logNum, int force)
 {
     struct stat sb;
-    struct logState *state = NULL;
+    struct logState *state;
     struct tm now;
 
     message(MESS_DEBUG, "considering log %s\n", log->files[logNum]);
@@ -1283,7 +1382,7 @@ static int findNeedRotating(const struct logInfo *log, unsigned logNum, int forc
     localtime_r(&nowSecs, &now);
 
     /* Check if parent directory of this log has safe permissions */
-    if ((log->flags & LOG_FLAG_SU) == 0 && getuid() == 0) {
+    if ((log->flags & LOG_FLAG_SU) == 0 && getuid() == ROOT_UID) {
         char *ld;
         char *logpath = strdup(log->files[logNum]);
         if (logpath == NULL) {
@@ -1343,6 +1442,13 @@ static int findNeedRotating(const struct logInfo *log, unsigned logNum, int forc
         return 0;
     }
 
+    if (!(log->flags & LOG_FLAG_ALLOWHARDLINK) && sb.st_nlink != 1) {
+        message(MESS_DEBUG, "  log %s has multiple (%lu) hard links. Rotation of files"
+                " with multiple hard links is not allowed for %s -- skipping.\n",
+                log->files[logNum], (unsigned long)sb.st_nlink, log->pattern);
+        return 0;
+    }
+
     message(MESS_DEBUG, "  Now: %d-%02d-%02d %02d:%02d\n", 1900 + now.tm_year,
             1 + now.tm_mon, now.tm_mday,
             now.tm_hour, now.tm_min);
@@ -1364,7 +1470,7 @@ static int findNeedRotating(const struct logInfo *log, unsigned logNum, int forc
             message(MESS_DEBUG, "  log does not need rotating "
                     "(log size is below the 'size' threshold)\n");
         }
-    } else if (mktime(&state->lastRotated) - mktime(&now) > (25 * 3600)) {
+    } else if (difftime(mktime(&state->lastRotated), mktime(&now)) > (25 * 3600)) {
         /* 25 hours allows for DST changes as well as geographical moves */
         message(MESS_ERROR,
                 "log %s last rotated in the future -- rotation forced\n",
@@ -1374,7 +1480,7 @@ static int findNeedRotating(const struct logInfo *log, unsigned logNum, int forc
             state->lastRotated.tm_mon != now.tm_mon ||
             state->lastRotated.tm_mday != now.tm_mday ||
             state->lastRotated.tm_hour != now.tm_hour) {
-        time_t days;
+        long days;
         switch (log->criterium) {
             case ROT_WEEKLY:
                 days = daysElapsed(&now, &state->lastRotated);
@@ -1453,7 +1559,7 @@ static int findNeedRotating(const struct logInfo *log, unsigned logNum, int forc
                     "('minsize' directive is used and the log "
                     "size is smaller than the minsize value)\n");
         }
-        if (log->rotateMinAge && log->rotateMinAge * DAY_SECONDS >= nowSecs - sb.st_mtime) {
+        if (log->rotateMinAge && log->rotateMinAge * DAY_SECONDS >= difftime(nowSecs, sb.st_mtime)) {
             state->doRotate = 0;
             message(MESS_DEBUG, "  log does not need rotating "
                     "('minage' directive is used and the log "
@@ -1552,12 +1658,13 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
     glob_t globResult;
     int rc;
     int rotateCount = log->rotateCount ? log->rotateCount : 1;
-    int logStart = (log->logStart == -1) ? 1 : log->logStart;
 #define DATEEXT_LEN 64
 #define PATTERN_LEN (DATEEXT_LEN * 2)
     char dext_str[DATEEXT_LEN];
     char dformat[PATTERN_LEN] = "";
     char dext_pattern[PATTERN_LEN];
+    const char *final_dformat;
+    size_t ret;
 
     if (!state->doRotate)
         return 0;
@@ -1677,19 +1784,19 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
     /* Construct the glob pattern corresponding to the date format */
     dext_str[0] = '\0';
     if (log->dateformat) {
-        char *dext;
+        const char *dext = log->dateformat;
         size_t i = 0, j = 0;
+
         memset(dext_pattern, 0, sizeof(dext_pattern));
-        dext = log->dateformat;
         while (*dext == ' ')
             dext++;
-        while ((*dext != '\0') && (!hasErrors)) {
+        while (*dext != '\0') {
             /* Will there be a space for a char and '\0'? */
-            if (j >= (sizeof(dext_pattern) - 1)) {
+            if (j >= (sizeof(dext_pattern) - 1) ||
+                i >= (sizeof(dformat) - 2)) {
                 message(MESS_ERROR, "Date format %s is too long\n",
                         log->dateformat);
-                hasErrors = 1;
-                break;
+                return 1;
             }
             if (*dext == '%') {
                 switch (*(dext + 1)) {
@@ -1710,8 +1817,7 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
                         if (j >= (sizeof(dext_pattern) - 1)) {
                             message(MESS_ERROR, "Date format %s is too long\n",
                                     log->dateformat);
-                            hasErrors = 1;
-                            break;
+                            return 1;
                         }
                         dformat[i++] = *(dext++);
                         dformat[i] = *dext;
@@ -1725,8 +1831,19 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
                         if (j >= (sizeof(dext_pattern) - 1)) {
                             message(MESS_ERROR, "Date format %s is too long\n",
                                     log->dateformat);
-                            hasErrors = 1;
-                            break;
+                            return 1;
+                        }
+                        dformat[i++] = *(dext++);
+                        dformat[i] = *dext;
+                        break;
+                    case 'z':
+                        strncat(dext_pattern, "[-+][0-9][0-9][0-9][0-9]",
+                                sizeof(dext_pattern) - strlen(dext_pattern) - 1);
+                        j += 24;
+                        if (j >= (sizeof(dext_pattern) - 1)) {
+                            message(MESS_ERROR, "Date format %s is too long\n",
+                                    log->dateformat);
+                            return 1;
                         }
                         dformat[i++] = *(dext++);
                         dformat[i] = *dext;
@@ -1746,25 +1863,32 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
         }
         dformat[i] = '\0';
         message(MESS_DEBUG, "Converted '%s' -> '%s'\n", log->dateformat, dformat);
-        strftime(dext_str, sizeof(dext_str), dformat, &now);
+        final_dformat = dformat;
     } else {
         if (log->criterium == ROT_HOURLY) {
             /* hourly adds another two digits */
-            strftime(dext_str, sizeof(dext_str), "-%Y%m%d%H", &now);
+            final_dformat = "-%Y%m%d%H";
             strncpy(dext_pattern, "-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]",
                     sizeof(dext_pattern));
         } else {
             /* The default dateformat and glob pattern */
-            strftime(dext_str, sizeof(dext_str), "-%Y%m%d", &now);
+            final_dformat = "-%Y%m%d";
             strncpy(dext_pattern, "-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]",
                     sizeof(dext_pattern));
         }
         dext_pattern[PATTERN_LEN - 1] = '\0';
     }
+
+    ret = strftime(dext_str, sizeof(dext_str), final_dformat, &now);
+    if (ret == 0) {
+        message(MESS_ERROR, "failed to apply date format '%s'\n", final_dformat);
+        return 1;
+    }
+
     message(MESS_DEBUG, "dateext suffix '%s'\n", dext_str);
     message(MESS_DEBUG, "glob pattern '%s'\n", dext_pattern);
 
-    if (setSecCtxByName(log->files[logNum], &prev_context) != 0) {
+    if (setSecCtxByName(log->files[logNum], log, &prev_context) != 0) {
         /* error msg already printed */
         return 1;
     }
@@ -1806,7 +1930,7 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
             struct stat sbprev;
             char *oldName;
             if (asprintf(&oldName, "%s/%s.%d%s", rotNames->dirName,
-                         rotNames->baseName, logStart, fileext) < 0) {
+                         rotNames->baseName, log->logStart, fileext) < 0) {
                 message_OOM();
                 return 1;
             }
@@ -1846,7 +1970,7 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
                     if (((globResult.gl_pathc >= (size_t)rotateCount) && (glob_count <= (globResult.gl_pathc - (size_t)rotateCount)))
                             || ((log->rotateAge > 0)
                                 &&
-                                (((nowSecs - fst_buf.st_mtime) / DAY_SECONDS)
+                                (((intmax_t)difftime(nowSecs, fst_buf.st_mtime) / DAY_SECONDS)
                                  > log->rotateAge))) {
                         if (mail_out != (size_t)-1) {
                             char *mailFilename =
@@ -1909,7 +2033,7 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
         }
 
         if (asprintf(&oldName, "%s/%s.%d%s%s", rotNames->dirName,
-                     rotNames->baseName, logStart + rotateCount, fileext,
+                     rotNames->baseName, log->logStart + rotateCount, fileext,
                      compext) < 0) {
             message_OOM();
             return 1;
@@ -1925,7 +2049,7 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
         }
 
         if (asprintf(&rotNames->firstRotated, "%s/%s.%d%s%s", rotNames->dirName,
-                rotNames->baseName, logStart, fileext,
+                rotNames->baseName, log->logStart, fileext,
                 (log->flags & LOG_FLAG_DELAYCOMPRESS) ? "" : compext) < 0) {
             message_OOM();
             free(oldName);
@@ -1933,7 +2057,7 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
             return 1;
         }
 
-        for (i = rotateCount + logStart - 1; (i >= 0) && !hasErrors; i--) {
+        for (i = rotateCount + log->logStart - 1; (i >= log->logStart) && !hasErrors; i--) {
             free(newName);
             newName = oldName;
             if (asprintf(&oldName, "%s/%s.%d%s%s", rotNames->dirName,
@@ -1960,7 +2084,7 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
                     continue;
                 }
 
-                if (((nowSecs - fst_buf.st_mtime) / DAY_SECONDS) > log->rotateAge) {
+                if (((intmax_t)difftime(nowSecs, fst_buf.st_mtime) / DAY_SECONDS) > log->rotateAge) {
                     if (!hasErrors && log->logAddress)
                         hasErrors = mailLogWrapper(oldName, mailCommand,
                                                    logNum, log);
@@ -1973,7 +2097,7 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
 
             message(MESS_DEBUG,
                     "renaming %s to %s (rotatecount %d, logstart %d, i %d), \n",
-                    oldName, newName, rotateCount, logStart, i);
+                    oldName, newName, rotateCount, log->logStart, i);
 
             if (!debug && rename(oldName, newName)) {
                 if (errno == ENOENT) {
@@ -2014,7 +2138,7 @@ static int prerotateSingleLog(const struct logInfo *log, unsigned logNum,
     } else {
         /* note: the gzip extension is *not* used here! */
         if (asprintf(&(rotNames->finalName), "%s/%s.%d%s", rotNames->dirName,
-                     rotNames->baseName, logStart, fileext) < 0) {
+                     rotNames->baseName, log->logStart, fileext) < 0) {
             message_OOM();
             rotNames->finalName = NULL;
         }
@@ -2045,7 +2169,7 @@ static int rotateSingleLog(const struct logInfo *log, unsigned logNum,
     if (!hasErrors) {
 
         if (!(log->flags & (LOG_FLAG_COPYTRUNCATE | LOG_FLAG_COPY))) {
-            if (setSecCtxByName(log->files[logNum], &savedContext) != 0) {
+            if (setSecCtxByName(log->files[logNum], log, &savedContext) != 0) {
                 /* error msg already printed */
                 return 1;
             }
@@ -2134,7 +2258,7 @@ static int rotateSingleLog(const struct logInfo *log, unsigned logNum,
 
             if (!debug) {
                 if (!hasErrors) {
-                    int fd = createOutputFile(log->files[logNum], O_CREAT | O_RDWR,
+                    int fd = createOutputFile(log->files[logNum], O_RDWR,
                             &sb, prev_acl, have_create_mode);
 #ifdef WITH_ACL
                     if (prev_acl) {
@@ -2157,7 +2281,8 @@ static int rotateSingleLog(const struct logInfo *log, unsigned logNum,
                 && (log->flags & (LOG_FLAG_COPYTRUNCATE | LOG_FLAG_COPY))
                 && !(log->flags & LOG_FLAG_TMPFILENAME)) {
             hasErrors = copyTruncate(log->files[logNum], rotNames->finalName,
-                                     &state->sb, log->flags, !log->rotateCount);
+                                     &state->sb, log,
+                                     !log->rotateCount && !log->logAddress);
         }
 
 #ifdef WITH_ACL
@@ -2172,8 +2297,8 @@ static int rotateSingleLog(const struct logInfo *log, unsigned logNum,
 }
 
 static int postrotateSingleLog(const struct logInfo *log, unsigned logNum,
-                               struct logState *state,
-                               struct logNames *rotNames)
+                               const struct logState *state,
+                               const struct logNames *rotNames)
 {
     int hasErrors = 0;
 
@@ -2188,7 +2313,7 @@ static int postrotateSingleLog(const struct logInfo *log, unsigned logNum,
             return 1;
         }
         hasErrors = copyTruncate(tmpFilename, rotNames->finalName,
-                                 &state->sb, LOG_FLAG_COPY, /* skip_copy */ 0);
+                                 &state->sb, log, /* skip_copy */ 0);
         message(MESS_DEBUG, "removing tmp log %s\n", tmpFilename);
         if (!debug && !hasErrors) {
             unlink(tmpFilename);
@@ -2198,11 +2323,18 @@ static int postrotateSingleLog(const struct logInfo *log, unsigned logNum,
 
     if (!hasErrors && (log->flags & LOG_FLAG_COMPRESS) &&
             !(log->flags & LOG_FLAG_DELAYCOMPRESS)) {
-        hasErrors = compressLogFile(rotNames->finalName, log, &state->sb);
+        /* whether copying was skipped in rotateSingleLog() -> copyTruncate() */
+        int skipped_copy = (log->flags & (LOG_FLAG_COPYTRUNCATE | LOG_FLAG_COPY)) &&
+                           !(log->flags & LOG_FLAG_TMPFILENAME) &&
+                           !log->rotateCount &&
+                           !log->logAddress;
+
+        if (!skipped_copy)
+            hasErrors = compressLogFile(rotNames->finalName, log, &state->sb);
     }
 
     if (!hasErrors && log->logAddress) {
-        char *mailFilename;
+        const char *mailFilename;
 
         if (log->flags & LOG_FLAG_MAILFIRST)
             mailFilename = rotNames->firstRotated;
@@ -2259,11 +2391,6 @@ static int rotateLogSet(const struct logInfo *log, int force)
         }
     }
 
-    if (log->rotateCount > 0)
-        message(MESS_DEBUG, "(%d rotations)\n", log->rotateCount);
-    else if (log->rotateCount == 0)
-        message(MESS_DEBUG, "(no old logs will be kept)\n");
-
     if (log->oldDir)
         message(MESS_DEBUG, "olddir is %s, ", log->oldDir);
 
@@ -2281,10 +2408,27 @@ static int rotateLogSet(const struct logInfo *log, int force)
     if (log->rotateMinAge)
         message(MESS_DEBUG, "only log files older than %d days are rotated, ", log->rotateMinAge);
 
-    if (log->logAddress) {
-        message(MESS_DEBUG, "old logs mailed to %s\n", log->logAddress);
-    } else {
-        message(MESS_DEBUG, "old logs are removed\n");
+    if ((log->rotateCount == -1) && (log->rotateAge == 0))
+        message(MESS_DEBUG, "old logs are kept forever\n");
+    else {
+        if (log->logAddress)
+            message(MESS_DEBUG, "old logs mailed to %s, ", log->logAddress);
+
+        if (log->rotateCount == 0)
+            message(MESS_DEBUG, "no old logs will be kept\n");
+        else {
+            if (log->rotateCount == -1)
+                message(MESS_DEBUG, "(unlimited rotations), ");
+            else
+                message(MESS_DEBUG, "(%d rotations), ", log->rotateCount);
+
+            message(MESS_DEBUG, "old logs are removed");
+
+            if (log->rotateAge > 0)
+                message(MESS_DEBUG, " after %d days", log->rotateAge);
+
+            message(MESS_DEBUG, "\n");
+        }
     }
 
     if (log->numFiles == 0) {
@@ -2306,7 +2450,7 @@ static int rotateLogSet(const struct logInfo *log, int force)
     }
 
     for (i = 0; i < log->numFiles; i++) {
-        struct logState *logState;
+        const struct logState *logState;
         logHasErrors[i] = findNeedRotating(log, i, force);
         hasErrors |= logHasErrors[i];
 
@@ -2375,10 +2519,6 @@ static int rotateLogSet(const struct logInfo *log, int force)
                 return 1;
             }
             memset(rotNames[i], 0, sizeof(struct logNames));
-
-            logHasErrors[i] |=
-                prerotateSingleLog(log, i, state[i], rotNames[i]);
-            hasErrors |= logHasErrors[i];
         }
 
         if (log->pre
@@ -2409,6 +2549,16 @@ static int rotateLogSet(const struct logInfo *log, int force)
         }
 
         for (i = j;
+             ((log->flags & LOG_FLAG_SHAREDSCRIPTS) && i < log->numFiles)
+             || (!(log->flags & LOG_FLAG_SHAREDSCRIPTS) && i == j); i++) {
+            if (! ( (logHasErrors[i] && !(log->flags & LOG_FLAG_SHAREDSCRIPTS))
+                    || (hasErrors && (log->flags & LOG_FLAG_SHAREDSCRIPTS)) ) ) {
+                logHasErrors[i] |= prerotateSingleLog(log, i, state[i], rotNames[i]);
+                hasErrors |= logHasErrors[i];
+            }
+        }
+
+        for (i = j;
                 ((log->flags & LOG_FLAG_SHAREDSCRIPTS) && i < log->numFiles)
                 || (!(log->flags & LOG_FLAG_SHAREDSCRIPTS) && i == j); i++) {
             if (! ( (logHasErrors[i] && !(log->flags & LOG_FLAG_SHAREDSCRIPTS))
@@ -2429,10 +2579,10 @@ static int rotateLogSet(const struct logInfo *log, int force)
                 message(MESS_DEBUG, "not running postrotate script, "
                         "since no logs were rotated\n");
             } else {
-                char *logfn = (log->flags & LOG_FLAG_SHAREDSCRIPTS) ? log->pattern : log->files[j];
+                const char *logfn = (log->flags & LOG_FLAG_SHAREDSCRIPTS) ? log->pattern : log->files[j];
 
                 /* It only makes sense to pass in a final rotated filename if scripts are not shared */
-                char *logrotfn = (log->flags & LOG_FLAG_SHAREDSCRIPTS) ? NULL : rotNames[j]->finalName;
+                const char *logrotfn = (log->flags & LOG_FLAG_SHAREDSCRIPTS) ? NULL : rotNames[j]->finalName;
 
                 message(MESS_DEBUG, "running postrotate script\n");
                 if (runScript(log, logfn, logrotfn, log->post)) {
@@ -2511,15 +2661,39 @@ static int writeState(const char *stateFilename)
     int fdsave;
     struct stat sb;
     char *tmpFilename = NULL;
-    struct tm now;
-    time_t now_time, last_time;
+    time_t last_time;
     char *prevCtx;
+    int force_mode = 0;
 
-    localtime_r(&nowSecs, &now);
+    if (!strcmp(stateFilename, "/dev/null"))
+        /* explicitly asked not to write the state file */
+        return 0;
+
+    fdcurr = open(stateFilename, O_RDONLY);
+    if (fdcurr == -1) {
+        /* the statefile should exist, lockState() already created an empty
+         * state file in case it did not exist initially */
+        message(MESS_ERROR, "error opening state file %s: %s\n",
+                stateFilename, strerror(errno));
+        return 1;
+    }
+
+    if (fstat(fdcurr, &sb) == -1) {
+        message(MESS_ERROR, "error stating %s: %s\n", stateFilename, strerror(errno));
+        close(fdcurr);
+        return 1;
+    }
+
+    if (!S_ISREG(sb.st_mode)) {
+        message(MESS_ERROR, "not writing state to %s because it is not a regular file\n", stateFilename);
+        close(fdcurr);
+        return 1;
+    }
 
     tmpFilename = malloc(strlen(stateFilename) + 5 );
     if (tmpFilename == NULL) {
         message_OOM();
+        close(fdcurr);
         return 1;
     }
     strcpy(tmpFilename, stateFilename);
@@ -2530,19 +2704,10 @@ static int writeState(const char *stateFilename)
         message(MESS_ERROR, "error removing old temporary state file %s: %s\n",
                 tmpFilename, strerror(errno));
         free(tmpFilename);
+        close(fdcurr);
         return 1;
     }
     error = 0;
-
-    fdcurr = open(stateFilename, O_RDONLY);
-    if (fdcurr == -1) {
-        /* the statefile should exist, lockState() already created an empty
-         * state file in case it did not exist initially */
-        message(MESS_ERROR, "error opening state file %s: %s\n",
-                stateFilename, strerror(errno));
-        free(tmpFilename);
-        return 1;
-    }
 
     /* get attributes, to assign them to the new state file */
 
@@ -2566,22 +2731,15 @@ static int writeState(const char *stateFilename)
     }
 #endif
 
-    if (fstat(fdcurr, &sb) == -1) {
-        message(MESS_ERROR, "error stating %s: %s\n", stateFilename, strerror(errno));
-        restoreSecCtx(&prevCtx);
-        free(tmpFilename);
-#ifdef WITH_ACL
-        if (prev_acl) {
-            acl_free(prev_acl);
-            prev_acl = NULL;
-        }
-#endif
-        return 1;
-    }
-
     close(fdcurr);
 
-    fdsave = createOutputFile(tmpFilename, O_RDWR | O_CREAT | O_TRUNC, &sb, prev_acl, 0);
+    if (sb.st_mode & (mode_t)S_IROTH) {
+        /* drop world-readable flag to prevent others from locking */
+        sb.st_mode &= ~(mode_t)S_IROTH;
+        force_mode = 1;
+    }
+
+    fdsave = createOutputFile(tmpFilename, O_RDWR, &sb, prev_acl, force_mode);
 #ifdef WITH_ACL
     if (prev_acl) {
         acl_free(prev_acl);
@@ -2619,9 +2777,8 @@ static int writeState(const char *stateFilename)
                 p = p->list.le_next) {
 
             /* Skip states which are not used for more than a year. */
-            now_time = mktime(&now);
             last_time = mktime(&p->lastRotated);
-            if (!p->isUsed && difftime(now_time, last_time) > SECONDS_IN_YEAR) {
+            if (!p->isUsed && difftime(nowSecs, last_time) > SECONDS_IN_YEAR) {
                 message(MESS_DEBUG, "Removing %s from state file, "
                         "because it does not exist and has not been rotated for one year\n",
                         p->fn);
@@ -2703,14 +2860,8 @@ static int readState(const char *stateFilename)
 {
     FILE *f;
     char buf[STATEFILE_BUFFER_SIZE];
-    char *filename;
-    const char **argv;
-    int argc;
-    int year, month, day, hour, minute, second;
     int line = 0;
     int fd;
-    struct logState *st;
-    time_t lr_time;
     struct stat f_stat;
     int rc = 0;
 
@@ -2721,16 +2872,19 @@ static int readState(const char *stateFilename)
         /* treat non-openable file as an empty file for allocateHash() */
         f_stat.st_size = 0;
 
-        /* the statefile should exist, lockState() already created an empty
-         * state file in case it did not exist initially */
-        message(MESS_ERROR, "error opening state file %s: %s\n",
-                stateFilename, strerror(errno));
-
         /* Do not return until the hash table is allocated.
          * In debug mode the state file might not exist,
          * cause lockState() is not called */
         if (!debug) {
+            message(MESS_ERROR, "error opening state file %s: %s\n",
+                    stateFilename, strerror(errno));
             rc = 1;
+        } else if (errno == ENOENT) {
+            message(MESS_DEBUG, "state file %s does not exist\n",
+                    stateFilename);
+        } else {
+           message(MESS_ERROR, "error opening state file %s; assuming empty state: %s\n",
+                   stateFilename, strerror(errno));
         }
     } else {
         if (fstat(fd, &f_stat) == -1) {
@@ -2786,7 +2940,13 @@ static int readState(const char *stateFilename)
 
     while (fgets(buf, sizeof(buf) - 1, f)) {
         const size_t i = strlen(buf);
-        argv = NULL;
+        char *filename;
+        int argc;
+        const char **argv = NULL;
+        int year, month, day, hour, minute, second;
+        struct logState *st;
+        time_t lr_time;
+
         line++;
         if (i == 0) {
             message(MESS_ERROR, "line %d not parsable in state file %s\n",
@@ -2912,17 +3072,25 @@ static int readState(const char *stateFilename)
     return 0;
 }
 
-static int lockState(const char *stateFilename, int skip_state_lock)
+static int lockState(const char *stateFilename, int skip_state_lock, int wait_for_state_lock)
 {
-    int lockFd = open(stateFilename, O_RDWR | O_CLOEXEC);
+    int lockFd;
+    int lockFlags;
+    struct stat sb;
+
+    if (!strcmp(stateFilename, "/dev/null")) {
+        return 0;
+    }
+
+    lockFd = open(stateFilename, O_RDWR | O_CLOEXEC);
     if (lockFd == -1) {
         if (errno == ENOENT) {
             message(MESS_DEBUG, "Creating stub state file: %s\n",
                     stateFilename);
 
-            /* create a stub state file with mode 0644 */
+            /* create a stub state file with mode 0640 */
             lockFd = open(stateFilename, O_CREAT | O_EXCL | O_WRONLY,
-                          S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
+                          S_IWUSR | S_IRUSR | S_IRGRP);
             if (lockFd == -1) {
                 message(MESS_ERROR, "error creating stub state file %s: %s\n",
                         stateFilename, strerror(errno));
@@ -2942,7 +3110,29 @@ static int lockState(const char *stateFilename, int skip_state_lock)
         return 0;
     }
 
-    if (flock(lockFd, LOCK_EX | LOCK_NB) == -1) {
+    if (fstat(lockFd, &sb) == -1) {
+        message(MESS_ERROR, "error stat()ing state file %s: %s\n",
+                stateFilename, strerror(errno));
+        close(lockFd);
+        return 1;
+    }
+
+    if (sb.st_mode & S_IROTH) {
+        message(MESS_WARN, "state file %s is world-readable"
+                " and thus can be locked from other unprivileged users."
+                " Skipping lock acquisition...\n",
+                stateFilename);
+        close(lockFd);
+        return 0;
+    }
+
+    lockFlags = LOCK_EX;
+    if (wait_for_state_lock)
+        message(MESS_DEBUG, "waiting for lock on state file %s\n", stateFilename);
+    else
+        lockFlags |= LOCK_NB;
+
+    if (flock(lockFd, lockFlags) == -1) {
         if (errno == EWOULDBLOCK) {
             message(MESS_ERROR, "state file %s is already locked\n"
                     "logrotate does not support parallel execution on the"
@@ -2955,6 +3145,8 @@ static int lockState(const char *stateFilename, int skip_state_lock)
         return 1;
     }
 
+    message(MESS_DEBUG, "acquired lock on state file %s\n", stateFilename);
+
     /* keep lockFd open till we terminate */
     return 0;
 }
@@ -2963,6 +3155,7 @@ int main(int argc, const char **argv)
 {
     int force = 0;
     int skip_state_lock = 0;
+    int wait_for_state_lock = 0;
     const char *stateFile = STATEFILE;
     const char *logFile = NULL;
     FILE *logFd = NULL;
@@ -2970,9 +3163,9 @@ int main(int argc, const char **argv)
     int arg;
     const char **files;
     poptContext optCon;
-    struct logInfo *log;
+    const struct logInfo *log;
 
-    struct poptOption options[] = {
+    const struct poptOption options[] = {
         {"debug", 'd', 0, NULL, 'd',
             "Don't do anything, just test and print debug messages", NULL},
         {"force", 'f', 0, &force, 0, "Force file rotation", NULL},
@@ -2983,6 +3176,7 @@ int main(int argc, const char **argv)
             "Path of state file",
             "statefile"},
         {"skip-state-lock", '\0', POPT_ARG_NONE, &skip_state_lock, 0, "Do not lock the state file", NULL},
+        {"wait-for-state-lock", '\0', POPT_ARG_NONE, &wait_for_state_lock, 0, "Wait for lock on the state file", NULL},
         {"verbose", 'v', 0, NULL, 'v', "Display messages during rotation", NULL},
         {"log", 'l', POPT_ARG_STRING, &logFile, 'l', "Log file or 'syslog' to log to syslog",
             "logfile"},
@@ -2990,7 +3184,7 @@ int main(int argc, const char **argv)
         POPT_AUTOHELP { NULL, 0, 0, NULL, 0, NULL, NULL }
     };
 
-    logSetLevel(MESS_NORMAL);
+    logSetLevel(MESS_WARN);
     setlocale (LC_ALL, "");
 
     optCon = poptGetContext("logrotate", argc, argv, options, 0);
@@ -3001,7 +3195,7 @@ int main(int argc, const char **argv)
         switch (arg) {
             case 'd':
                 debug = 1;
-                message(MESS_NORMAL, "WARNING: logrotate in debug mode does nothing"
+                message(MESS_WARN, "logrotate in debug mode does nothing"
                         " except printing debug messages!  Consider using verbose"
                         " mode (-v) instead if this is not what you want.\n\n");
                 /* fallthrough */
@@ -3066,6 +3260,14 @@ int main(int argc, const char **argv)
         poptFreeContext(optCon);
         exit(1);
     }
+
+    if (skip_state_lock && wait_for_state_lock) {
+        fprintf(stderr, "logrotate: options --skip-state-lock and"
+                " --wait-for-state-lock are mutually exclusive\n");
+        poptFreeContext(optCon);
+        exit(1);
+    }
+
 #ifdef WITH_SELINUX
     selinux_enabled = (is_selinux_enabled() > 0);
     selinux_enforce = security_getenforce();
@@ -3078,8 +3280,10 @@ int main(int argc, const char **argv)
 
     poptFreeContext(optCon);
     nowSecs = time(NULL);
+    /* localtime_r(3) is not required to call tzset(3) */
+    tzset();
 
-    if (!debug && lockState(stateFile, skip_state_lock)) {
+    if (!debug && lockState(stateFile, skip_state_lock, wait_for_state_lock)) {
         exit(3);
     }
 

@@ -9,12 +9,12 @@ cleanup 42
 preptest test.log 42 1
 echo number2 > test2.log
 
-$RLR test-config.42
+$RLR test-config.42 || exit 23
 
 checkoutput <<EOF
 test.log 0
 test.log.1 0 zero
 test2.log 0
 test2.log.1 0 number2
-scriptout 0 "test*.log ;test*.log ;"
+scriptout 0 "test*.log;test*.log;"
 EOF
