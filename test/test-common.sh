@@ -1,5 +1,18 @@
+# shellcheck shell=sh disable=SC2034
+
 # common variables and functions for legacy tests
-LOGROTATE="$(readlink -f $LOGROTATE)"
+
+if readlink -f $LOGROTATE > /dev/null 2>&1; then
+  LOGROTATE="$(readlink -f $LOGROTATE)"
+elif greadlink -f $LOGROTATE > /dev/null 2>&1; then
+  LOGROTATE="$(greadlink -f $LOGROTATE)"
+else
+  echo "no readlink with canonicalize option found:"
+  readlink -f $LOGROTATE
+  greadlink -f $LOGROTATE
+  exit 1
+fi
+
 RLR="$LOGROTATE -v -m ./mailer -s state"
 
 if du --apparent-size $LOGROTATE > /dev/null 2>&1; then
@@ -7,10 +20,10 @@ if du --apparent-size $LOGROTATE > /dev/null 2>&1; then
 elif du -A $LOGROTATE > /dev/null 2>&1; then
   DU_APPARENT_SIZE='du -A'
 else
-  echo "no du option for apparent size found:"
+  echo "no du option for apparent size found, using default mode:"
   du --apparent-size $LOGROTATE
   du -A $LOGROTATE
-  exit 1
+  DU_APPARENT_SIZE='du'
 fi
 
 if command -v md5sum > /dev/null 2>&1; then
@@ -24,12 +37,29 @@ fi
 
 if stat -c %f $LOGROTATE > /dev/null 2>&1; then
   STAT_MODE_FORMAT='stat -c %f'
+  STAT_ATIME_FORMAT='stat -c %X'
+  STAT_MTIME_FORMAT='stat -c %Y'
 elif stat -f %Xp $LOGROTATE > /dev/null 2>&1; then
   STAT_MODE_FORMAT='stat -f %Xp'
+  STAT_ATIME_FORMAT='stat -f %a'
+  STAT_MTIME_FORMAT='stat -f %m'
 else
   echo "no stat format option found:"
   stat -c %f $LOGROTATE
   stat -f %Xp $LOGROTATE
+  exit 1
+fi
+
+# check for date(1) support of operating on a time given from the command
+# line instead of the current time. Necessary for test 0085.
+if date --date @42 +%Y%m%d%H%M > /dev/null 2>&1; then
+  DATE_DATEARG='date --date'
+elif gdate --date @42 +%Y%m%d%H%M > /dev/null 2>&1; then
+  DATE_DATEARG='gdate --date'
+else
+  echo "no date command supporting argument --date found:"
+  date --date @42 +%Y%m%d%H%M
+  gdate --date @42 +%Y%m%d%H%M
   exit 1
 fi
 
@@ -65,7 +95,7 @@ genconfig() {
     user=$(id -u -n)
     group=$(id -g -n)
     rootgroup=$(id -g -n root)
-    sed "s,&DIR&,$PWD,g" < $input | sed "s,&USER&,$user,g" | sed "s,&GROUP&,$group,g" | sed "s,&ROOTGROUP&,$rootgroup,g" > $output
+    sed "s,&DIR&,$PWD,g" < $input | sed "s,&USER&,\"$user\",g" | sed "s,&GROUP&,\"$group\",g" | sed "s,&ROOTGROUP&,\"$rootgroup\",g" > $output
     chmod go-w $output
     config_crc=$(${MD5SUM} $output)
 }
@@ -101,7 +131,7 @@ createlog() {
 	    what=seventh
 	    ;;
 	8)
-	    what=eight
+	    what=eighth
 	    ;;
 	9)
 	    what=ninth
@@ -131,7 +161,7 @@ createlogs() {
 }
 
 checkmail() {
-    (echo -s $PWD/$1 user@invalid.; echo $2) | diff -u - mail-out
+    printf "%s\n%s\n" "-s $PWD/$1 user@invalid." "$2" | diff -u - mail-out
     if [ $? != 0 ]; then
         exit 5
     fi
